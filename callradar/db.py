@@ -17,12 +17,21 @@ from typing import Any, Iterable
 from . import config
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS agent (
+    id   TEXT PRIMARY KEY,
+    name TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS customer (
+    id   TEXT PRIMARY KEY,
+    name TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS calls (
     id                TEXT PRIMARY KEY,
-    customer_id       TEXT,
-    customer_name     TEXT,
-    agent_id          TEXT,
-    agent_name        TEXT,
+    customer_id       TEXT REFERENCES customer(id),
+    agent_id          TEXT REFERENCES agent(id),
+    audio_mp3         BLOB,
     started_at        TEXT,
     started_ms        INTEGER,
     duration_sec      INTEGER,
@@ -33,12 +42,16 @@ CREATE TABLE IF NOT EXISTS calls (
     mood_shift_sec    REAL,
     needs_review      INTEGER DEFAULT 0,
     warnings          TEXT,
-    record            TEXT NOT NULL
+    record            TEXT NOT NULL,
+
+    -- Nested/array fields stored as JSON text
+    transcript      TEXT    NOT NULL CHECK (json_valid(transcript)),
+    moodTimeline    TEXT    NOT NULL CHECK (json_valid(moodTimeline)),
+    evidence        TEXT    NOT NULL CHECK (json_valid(evidence)),
+    metadata        TEXT    NOT NULL CHECK (json_valid(metadata)),
+
+    createdAtUtc    TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
 );
-CREATE INDEX IF NOT EXISTS idx_calls_customer ON calls(customer_id);
-CREATE INDEX IF NOT EXISTS idx_calls_agent    ON calls(agent_id);
-CREATE INDEX IF NOT EXISTS idx_calls_att      ON calls(needs_attention DESC);
-CREATE INDEX IF NOT EXISTS idx_calls_started  ON calls(started_ms);
 
 CREATE TABLE IF NOT EXISTS jobs (
     call_id   TEXT PRIMARY KEY,
@@ -60,6 +73,7 @@ def connect(path: str | Path | None = None) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
     return conn
@@ -71,34 +85,46 @@ def upsert_call(
     *,
     started_ms: int | None,
     issue_tag: str,
+    audio_mp3: bytes | None = None,
     needs_review: bool = False,
     warnings: list[str] | None = None,
 ) -> None:
     conn.execute(
         """
-        INSERT INTO calls (id, customer_id, customer_name, agent_id, agent_name,
+        INSERT INTO calls (id, customer_id, agent_id, audio_mp3,
                            started_at, started_ms, duration_sec, intent, issue_tag,
                            resolved, needs_attention, mood_shift_sec,
-                           needs_review, warnings, record)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                           needs_review, warnings, record,
+                           transcript, moodTimeline, evidence, metadata)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(id) DO UPDATE SET
-            customer_id=excluded.customer_id, customer_name=excluded.customer_name,
-            agent_id=excluded.agent_id, agent_name=excluded.agent_name,
+            customer_id=excluded.customer_id,
+            agent_id=excluded.agent_id,
+            audio_mp3=excluded.audio_mp3,
             started_at=excluded.started_at, started_ms=excluded.started_ms,
             duration_sec=excluded.duration_sec, intent=excluded.intent,
             issue_tag=excluded.issue_tag, resolved=excluded.resolved,
             needs_attention=excluded.needs_attention,
             mood_shift_sec=excluded.mood_shift_sec,
             needs_review=excluded.needs_review, warnings=excluded.warnings,
-            record=excluded.record
+            record=excluded.record,
+            transcript=excluded.transcript,
+            moodTimeline=excluded.moodTimeline,
+            evidence=excluded.evidence,
+            metadata=excluded.metadata
         """,
         (
-            record["id"], record["customerId"], record["customerName"],
-            record["agentId"], record["agentName"], record["startedAt"],
+            record["id"], record["customerId"],
+            record["agentId"], audio_mp3,
+            record["startedAt"],
             started_ms, record["durationSec"], record["intent"], issue_tag,
             1 if record["resolved"] else 0, record["needsAttention"],
             record["moodShiftSec"], 1 if needs_review else 0,
             json.dumps(warnings or []), json.dumps(record),
+            json.dumps(record.get("transcript", [])),
+            json.dumps(record.get("moodTimeline", [])),
+            json.dumps(record.get("evidence", [])),
+            json.dumps(record.get("metadata", {})),
         ),
     )
     conn.execute("DELETE FROM transcripts WHERE call_id = ?", (record["id"],))
