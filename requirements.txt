@@ -1,0 +1,13 @@
+# --- core pipeline -----------------------------------------------------
+groq>=0.11.0
+numpy>=1.26
+python-dotenv>=1.0.0
+
+# --- API ---------------------------------------------------------------
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
+
+# --- optional: local (free, no API key) transcription ------------------
+# Only needed if you set ASR_BACKEND=faster_whisper
+# faster-whisper>=1.0.3

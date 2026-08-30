@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.env
+.venv/
+venv/
+data/work/
+data/audio/*.mp3
+data/metadata/*.json
+!data/audio/.gitkeep
+!data/metadata/.gitkeep
+*.wav
+nohup.out
+# NOTE: data/callradar.db is intentionally NOT ignored.
+# Commit it so the demo runs instantly without re-processing.
