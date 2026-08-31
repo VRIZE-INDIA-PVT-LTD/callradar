@@ -172,6 +172,30 @@ def test_validator_rejects_non_verbatim_quote():
     assert any("not verbatim" in p for p in problems)
 
 
+def test_turns_do_not_overlap():
+    """A turn must never run past the start of the next one.
+
+    Reproduces a real case: Whisper stretched the customer's "3.45 PM." across
+    11 seconds of trailing silence, so the agent's reply at 44.16s sat entirely
+    inside it. Ordering is fine; the timestamps are what collide.
+    """
+    segs = [
+        Segment("customer", 41.22, 52.28, "3.45 PM."),
+        Segment("agent", 44.16, 45.48, "Can you repeat that for me, please?"),
+        Segment("customer", 52.28, 53.50, "3.45 PM. Can I get in?"),
+    ]
+    turns = merge_turns(segs)
+    assert len(turns) == 3, f"expected 3 turns, got {[t.text for t in turns]}"
+    for a, b in zip(turns, turns[1:]):
+        assert a.endSec <= b.startSec, (
+            f"turn {a.id} ends at {a.endSec}s but turn {b.id} starts at {b.startSec}s"
+        )
+    for t in turns:
+        assert t.endSec >= t.startSec, f"turn {t.id} ends before it starts"
+    # clamping must not disturb ordering or drop text
+    assert [t.speaker for t in turns] == ["customer", "agent", "customer"]
+
+
 def test_validator_rejects_bad_issue_tag():
     turns = [Turn(1, "customer", 0, 1, "hello")]
     bad = {

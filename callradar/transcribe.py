@@ -217,6 +217,15 @@ def merge_turns(segments: Iterable[Segment]) -> list[Turn]:
             )
     for i, t in enumerate(turns, start=1):
         t.id = i
+
+    # Each channel is transcribed independently, and Whisper sometimes stretches
+    # a segment's end across trailing silence - so one speaker's turn can swallow
+    # the other's reply ("3.45 PM." spanning 41.2-52.3s while the agent speaks at
+    # 44.2s). Analysis is unaffected (the model sees ordered ids, never clocks),
+    # but a timeline UI would draw the two turns on top of each other.
+    for cur, nxt in zip(turns, turns[1:]):
+        if cur.endSec > nxt.startSec:
+            cur.endSec = round(max(cur.startSec, nxt.startSec), 2)
     return turns
 
 

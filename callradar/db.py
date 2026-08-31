@@ -16,7 +16,23 @@ from typing import Any, Iterable
 
 from . import config
 
+# Bump whenever SCHEMA changes in a way an existing database cannot satisfy.
+# CREATE TABLE IF NOT EXISTS does NOT alter a table that already exists, so a
+# new column silently yields "table calls has no column named X" at write time,
+# far from the edit that caused it. connect() checks this and says so up front.
+SCHEMA_VERSION = 2
+
+
+class SchemaVersionError(RuntimeError):
+    """Raised when an existing database predates the current SCHEMA."""
+
+
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS agent (
     id   TEXT PRIMARY KEY,
     name TEXT NOT NULL
@@ -75,8 +91,49 @@ def connect(path: str | Path | None = None) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
+
+    # An empty file is a fresh database; anything with a `calls` table predates
+    # this connect() and must prove it matches the current SCHEMA.
+    is_existing = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='calls'"
+    ).fetchone() is not None
+    if is_existing:
+        found = _stored_schema_version(conn)
+        if found != SCHEMA_VERSION:
+            wal = f"{path.name}-wal"
+            shm = f"{path.name}-shm"
+            raise SchemaVersionError(
+                f"Database schema is version {found if found is not None else 1} "
+                f"but this code expects {SCHEMA_VERSION}. "
+                f"Delete {path} (and any {wal}/{shm} files) and re-run: "
+                f"python scripts/run_batch.py"
+            )
+
     conn.executescript(SCHEMA)
+    # Only stamps a fresh database; an existing one already passed the check.
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
+        "ON CONFLICT(key) DO NOTHING",
+        (str(SCHEMA_VERSION),),
+    )
+    conn.commit()
     return conn
+
+
+def _stored_schema_version(conn: sqlite3.Connection) -> int | None:
+    """Version recorded in `meta`, or None if this DB predates the meta table."""
+    try:
+        row = conn.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None  # no meta table at all -> version 1, before this mechanism
+    if row is None:
+        return None
+    try:
+        return int(row["value"])
+    except (TypeError, ValueError):
+        return None
 
 
 def upsert_call(
@@ -89,6 +146,29 @@ def upsert_call(
     needs_review: bool = False,
     warnings: list[str] | None = None,
 ) -> None:
+    # calls.customer_id and calls.agent_id are foreign keys, so the parent rows
+    # have to exist first. Same transaction as the calls insert below - commit()
+    # at the end of this function is the only commit, so a failure anywhere
+    # rolls the whole call back rather than leaving an orphan parent.
+    #
+    # A blank id is stored as NULL rather than "": SQLite allows NULL in a
+    # foreign key, so this keeps unknown parties writable without inventing a
+    # placeholder parent row for them.
+    customer_id = record.get("customerId") or None
+    agent_id = record.get("agentId") or None
+    if customer_id:
+        conn.execute(
+            """INSERT INTO customer (id, name) VALUES (?,?)
+               ON CONFLICT(id) DO UPDATE SET name=excluded.name""",
+            (customer_id, record.get("customerName") or "Unknown"),
+        )
+    if agent_id:
+        conn.execute(
+            """INSERT INTO agent (id, name) VALUES (?,?)
+               ON CONFLICT(id) DO UPDATE SET name=excluded.name""",
+            (agent_id, record.get("agentName") or "Unknown"),
+        )
+
     conn.execute(
         """
         INSERT INTO calls (id, customer_id, agent_id, audio_mp3,
@@ -114,8 +194,8 @@ def upsert_call(
             metadata=excluded.metadata
         """,
         (
-            record["id"], record["customerId"],
-            record["agentId"], audio_mp3,
+            record["id"], customer_id,
+            agent_id, audio_mp3,
             record["startedAt"],
             started_ms, record["durationSec"], record["intent"], issue_tag,
             1 if record["resolved"] else 0, record["needsAttention"],

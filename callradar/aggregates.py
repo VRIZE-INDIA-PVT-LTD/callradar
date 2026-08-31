@@ -70,14 +70,14 @@ def trending_issues(conn: sqlite3.Connection, window_days: int = 7) -> list[dict
 def agent_metrics(conn: sqlite3.Connection) -> list[dict]:
     """`AgentMetric[]`: volume, average handle time, resolution rate."""
     rows = conn.execute(
-        """SELECT agent_id, agent_name,
+        """SELECT c.agent_id AS agent_id, a.name AS agent_name,
                   COUNT(*)                       AS call_volume,
-                  AVG(duration_sec)              AS avg_handle,
-                  AVG(CASE WHEN resolved=1 THEN 1.0 ELSE 0.0 END) AS resolved_pct,
-                  SUM(CASE WHEN needs_attention >= 70 THEN 1 ELSE 0 END) AS escalations
-           FROM calls
-           WHERE agent_id != ''
-           GROUP BY agent_id, agent_name
+                  AVG(c.duration_sec)            AS avg_handle,
+                  AVG(CASE WHEN c.resolved=1 THEN 1.0 ELSE 0.0 END) AS resolved_pct,
+                  SUM(CASE WHEN c.needs_attention >= 70 THEN 1 ELSE 0 END) AS escalations
+           FROM calls c
+           JOIN agent a ON a.id = c.agent_id
+           GROUP BY c.agent_id, a.name
            ORDER BY call_volume DESC"""
     ).fetchall()
     return [
@@ -95,10 +95,13 @@ def agent_metrics(conn: sqlite3.Connection) -> list[dict]:
 
 def customers(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
-        """SELECT customer_id, customer_name, COUNT(*) AS calls,
-                  MAX(needs_attention) AS worst
-           FROM calls WHERE customer_id != ''
-           GROUP BY customer_id, customer_name ORDER BY customer_name"""
+        """SELECT c.customer_id AS customer_id, cu.name AS customer_name,
+                  COUNT(*) AS calls,
+                  MAX(c.needs_attention) AS worst
+           FROM calls c
+           JOIN customer cu ON cu.id = c.customer_id
+           GROUP BY c.customer_id, cu.name
+           ORDER BY cu.name"""
     ).fetchall()
     return [
         {
@@ -113,6 +116,8 @@ def customers(conn: sqlite3.Connection) -> list[dict]:
 
 def agents(conn: sqlite3.Connection) -> list[dict]:
     rows = conn.execute(
-        "SELECT DISTINCT agent_id, agent_name FROM calls WHERE agent_id != '' ORDER BY agent_name"
+        """SELECT DISTINCT c.agent_id AS agent_id, a.name AS agent_name
+           FROM calls c JOIN agent a ON a.id = c.agent_id
+           ORDER BY a.name"""
     ).fetchall()
     return [{"id": r["agent_id"], "name": r["agent_name"]} for r in rows]
