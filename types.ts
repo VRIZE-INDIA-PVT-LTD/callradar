@@ -97,6 +97,13 @@ export interface CallRecord {
 export interface Customer { id: string; name: string; callCount?: number; worstAttention?: number; }
 export interface Agent { id: string; name: string; }
 
+/** GET /api/bundle — everything the first screen needs in one request. */
+export interface BundleResponse {
+  agents: Agent[];
+  customers: Customer[];
+  calls: CallRecord[];
+}
+
 export interface TrendingIssue {
   issueTag: string;
   count: number;

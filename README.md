@@ -190,6 +190,7 @@ freeze it before the bulk run.
 | `GET /api/attention?limit=50` | the ranked "needs a manager today" queue |
 | `GET /api/trends?windowDays=7` | trending issues + deltas |
 | `GET /api/search?q=refund` | full-text search across every transcript |
+| `GET /api/bundle` | `agents` + `customers` + `calls` in one request; optional `limit`/`offset` apply to `calls` only, unlimited by default |
 | `POST /api/process` | **live**: send an mp3 + metadata, get the analysis back |
 
 `/api/calls/{id}/audio` returns `206 Partial Content` with `accept-ranges:
@@ -204,7 +205,17 @@ curl -X POST http://localhost:8000/api/process \
   -F "metadata=@data/metadata/abc123.json"
 ```
 
-Metadata can also be a JSON string field: `-F "metadataJson={...}"`.
+Metadata may be a file **or** a JSON string, under either name — all four of
+these work:
+
+```bash
+-F "metadata=@data/metadata/abc123.json"   # file
+-F "metadata={...}"                        # string, same field name
+-F "metadataJson={...}"                    # string, legacy field name
+```
+
+Missing or malformed metadata comes back as `400` with the parse error, never
+a `500`.
 
 Same models as the bulk run, so a call processed live on stage is
 indistinguishable from one processed in advance.

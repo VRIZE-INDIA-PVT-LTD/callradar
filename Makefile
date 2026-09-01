@@ -17,8 +17,13 @@ help:
 install:
 	pip install -r requirements.txt
 
+# Override with e.g. `make test PYTHON=.venv/bin/python` - the API tests need
+# fastapi, which the pipeline tests do not.
+PYTHON ?= python3
+
 test:
-	ASR_BACKEND=mock LLM_BACKEND=mock python3 tests/test_contract.py
+	ASR_BACKEND=mock LLM_BACKEND=mock $(PYTHON) tests/test_contract.py
+	ASR_BACKEND=mock LLM_BACKEND=mock $(PYTHON) tests/test_api.py
 
 # Runs with zero API keys - proves the plumbing works before you spend anything.
 smoke:

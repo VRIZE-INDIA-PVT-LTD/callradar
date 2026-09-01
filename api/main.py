@@ -5,6 +5,9 @@ Two kinds of endpoint:
   READ (everything precomputed) - the dashboard only ever reads. Nothing is
   transcribed at request time, which is an explicit requirement of the brief.
 
+  GET /api/bundle - agents + customers + calls in one round trip, so the
+  dashboard's first screen is one request rather than three.
+
   POST /api/process - the live demo path. Judges hand over an mp3 + metadata
   json as multipart form data; it runs the same pipeline, stores the result and
   returns the full CallRecord. Same models as the bulk run, so a call processed
@@ -16,10 +19,11 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -57,14 +61,19 @@ def health(conn=Depends(get_conn)):
 
 
 # ------------------------------------------------------------------ reads
-@app.get("/api/calls")
-def list_calls(
-    conn=Depends(get_conn),
-    limit: int = Query(50, le=500),
+def _query_calls(
+    conn,
+    *,
+    limit: int | None = None,
     offset: int = 0,
     customerId: str | None = None,
     agentId: str | None = None,
-):
+) -> list[dict]:
+    """The one place calls are listed. `/api/calls` and `/api/bundle` both go
+    through here so their ordering and filtering can never drift apart.
+
+    `limit=None` means no limit - SQLite reads a negative LIMIT as unbounded,
+    which keeps OFFSET usable without a second query shape."""
     sql = "SELECT record FROM calls WHERE 1=1"
     args: list = []
     if customerId:
@@ -74,8 +83,41 @@ def list_calls(
         sql += " AND agent_id = ?"
         args.append(agentId)
     sql += " ORDER BY started_ms DESC LIMIT ? OFFSET ?"
-    args += [limit, offset]
+    args += [-1 if limit is None else limit, offset]
     return [json.loads(r["record"]) for r in conn.execute(sql, args)]
+
+
+@app.get("/api/calls")
+def list_calls(
+    conn=Depends(get_conn),
+    limit: int = Query(50, le=500),
+    offset: int = 0,
+    customerId: str | None = None,
+    agentId: str | None = None,
+):
+    return _query_calls(
+        conn, limit=limit, offset=offset, customerId=customerId, agentId=agentId
+    )
+
+
+@app.get("/api/bundle")
+def bundle(
+    conn=Depends(get_conn),
+    limit: int | None = Query(None, ge=1, description="applies to `calls` only"),
+    offset: int = Query(0, ge=0, description="applies to `calls` only"),
+):
+    """`BundleResponse`: agents + customers + calls in one round trip.
+
+    The dashboard needs all three to render its first screen; three requests
+    to fetch them is three chances to render half a page. `calls` is unlimited
+    by default - the corpus is ~1,400 rows, which is smaller than the audio for
+    a single call.
+    """
+    return {
+        "agents": aggregates.agents(conn),
+        "customers": aggregates.customers(conn),
+        "calls": _query_calls(conn, limit=limit, offset=offset),
+    }
 
 
 @app.get("/api/calls/{call_id}")
@@ -148,26 +190,100 @@ def search(q: str, conn=Depends(get_conn), limit: int = Query(50, le=200)):
 
 
 # ------------------------------------------------------------- live process
-@app.post("/api/process")
+# The metadata field is read straight off the raw multipart body rather than
+# declared as a parameter, so it is documented by hand.
+_PROCESS_FORM = {
+    "requestBody": {
+        "required": True,
+        "content": {
+            "multipart/form-data": {
+                "schema": {
+                    "type": "object",
+                    "required": ["audio"],
+                    "properties": {
+                        "audio": {
+                            "type": "string",
+                            "format": "binary",
+                            "description": "Call recording (stereo mp3)",
+                        },
+                        "metadata": {
+                            "type": "string",
+                            "description": "Call metadata JSON - either an "
+                            "uploaded .json file or the JSON text itself",
+                        },
+                        "metadataJson": {
+                            "type": "string",
+                            "description": "Legacy alias for metadata as a string",
+                        },
+                    },
+                }
+            }
+        },
+    }
+}
+
+
+async def _form_text(value: Any) -> str | None:
+    """Collapse one multipart value to text, whether it arrived as a file part
+    or a plain field.
+
+    A caller should not have to use a different field name depending on how
+    they packed the same JSON: the browser sends `metadata` as a string, curl's
+    `-F metadata=@file.json` sends it as a file, and both are legitimate. A
+    file part has `.read()`; a plain field is already a string.
+    """
+    if value is None:
+        return None
+    if hasattr(value, "read"):
+        data = await value.read()
+        if isinstance(data, (bytes, bytearray)):
+            try:
+                value = data.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                raise HTTPException(400, f"metadata is not UTF-8 text: {exc}") from exc
+        else:
+            value = data
+    return str(value).strip() or None
+
+
+@app.post("/api/process", openapi_extra=_PROCESS_FORM)
 async def process(
+    request: Request,
     audio: UploadFile = File(..., description="Call recording (stereo mp3)"),
-    metadata: UploadFile | None = File(None, description="Call metadata JSON"),
-    metadataJson: str | None = Form(None, description="Metadata JSON as a string"),
     conn=Depends(get_conn),
 ):
     """Transcribe + analyse one call and return the full CallRecord.
 
-    Accepts the metadata either as a second file or as a JSON string field, so
-    it works from curl, Postman and a browser form without fuss.
+    Metadata is accepted, in priority order, as: a `metadata` file part, a
+    `metadata` string field, or a `metadataJson` string field (kept for
+    backwards compatibility). FastAPI cannot overload one parameter name
+    across File and Form, so the form is inspected directly instead.
     """
-    if metadata is not None:
-        raw = json.loads((await metadata.read()).decode("utf-8"))
-    elif metadataJson:
-        raw = json.loads(metadataJson)
-    else:
-        raise HTTPException(400, "Provide metadata as a file or metadataJson field")
+    form = await request.form()
 
-    call_id = str(raw.get("sid") or Path(audio.filename).stem)
+    text = source = None
+    for field in ("metadata", "metadataJson"):
+        text = await _form_text(form.get(field))
+        if text:
+            source = field
+            break
+    if not text:
+        raise HTTPException(
+            400,
+            "No call metadata. Send it as 'metadata' - either a .json file part "
+            "or the JSON text as a form field - or as 'metadataJson'.",
+        )
+
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, f"{source} is not valid JSON: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise HTTPException(
+            400, f"{source} must be a JSON object, got {type(raw).__name__}"
+        )
+
+    call_id = str(raw.get("sid") or Path(audio.filename or "upload").stem)
     config.AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     dest = config.AUDIO_DIR / f"{call_id}.mp3"
     dest.write_bytes(await audio.read())
